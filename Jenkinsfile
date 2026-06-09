@@ -78,6 +78,8 @@ pipeline {
         // every idev env; the Helm values inject the per-env identity.
         sh '''
           docker build \
+            --provenance=false \
+            --platform linux/amd64 \
             --build-arg REGISTRY="${JFROG_VIRTUAL}/" \
             -t "${JFROG_APP_REPO}/${IMAGE_NAME}:${IMAGE_TAG}" \
             .
