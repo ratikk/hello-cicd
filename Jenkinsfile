@@ -1,21 +1,23 @@
 import java.util.Date
 
 // =============================================================================
-// hello-cicd — Jenkins CI, built in the HHS RAE pattern.
+// hello-cicd — Jenkins CI, pushing to Amazon ECR.
 //
-//   The image TAG is the Jenkins BUILD_NUMBER (auto-incrementing) — every build
-//   is uniquely numbered by Jenkins itself. ReleaseNumber selects the git BRANCH
-//   to build (not the tag). Images are pushed to JFrog as:
-//       <JFROG_URL>/<REPO_NAME>/<IMAGE_NAME>:<BUILD_NUMBER>
+//   The image TAG is the Jenkins BUILD_NUMBER (auto-incrementing). Images push to
+//   ECR at:  <ACCOUNT>.dkr.ecr.<REGION>.amazonaws.com/hello-cicd:<BUILD_NUMBER>
+//
+//   AUTH: the Jenkins EC2's IAM instance role (hub-jenkins-demo-role) has ECR
+//   push permission, so we authenticate with `aws ecr get-login-password` —
+//   NO stored Jenkins credential needed. Short-lived token, fetched per build.
+//
+//   ECR serves plain Docker v2 manifests by tag AND digest reliably (unlike the
+//   JFrog trial), so digests pinned in Git will actually pull on CRI-O.
 //
 //   To promote a build into an environment, edit that env's values file:
-//       environments/idevN/values.yaml  ->  image.tag: "<BUILD_NUMBER>"
+//       environments/idevN/values.yaml  ->  image.tag/digest
 //   commit + push the gitops repo -> ArgoCD deploys ONLY that environment.
 // =============================================================================
 
-// One entry per source repo. Exactly one must have isMain:true. For this lab
-// there is a single app repo; Jenkins checks it out into the workspace via
-// `checkout scm` (the job's configured Git repo/branch), so no path is needed.
 def projectReposFor = { String releaseNumber ->
   [
     [name: 'hello-cicd', isMain: true],
@@ -26,19 +28,18 @@ pipeline {
     agent any
 
     parameters {
-        string(name: 'ReleaseNumber',        defaultValue: 'main', description: 'Git branch to build (e.g. main, REL-1.2). Selects the branch, NOT the tag.')
-        string(name: 'ReleaseBranchPrefix',  defaultValue: '/REL', description: 'Branch prefix')
-        booleanParam(name: 'ForceBuild',     defaultValue: true,  description: 'Force Build')
-        booleanParam(name: 'SKIP_GIT_TAG',   defaultValue: false, description: 'Skip tagging + metadata')
+        string(name: 'ReleaseNumber',       defaultValue: 'main', description: 'Git branch to build (e.g. main). Selects the branch, NOT the tag.')
+        string(name: 'ReleaseBranchPrefix', defaultValue: '/REL', description: 'Branch prefix')
+        booleanParam(name: 'ForceBuild',    defaultValue: true,  description: 'Force Build')
+        booleanParam(name: 'SKIP_GIT_TAG',  defaultValue: false, description: 'Skip tagging + metadata')
     }
 
     environment {
-        JFROG_URL       = 'triald3uyq5.jfrog.io'
-        REPO_NAME       = 'sample-docker'
+        AWS_REGION      = 'us-east-1'
+        ECR_REGISTRY    = '025037641706.dkr.ecr.us-east-1.amazonaws.com'
         IMAGE_NAME      = 'hello-cicd'
-        TAG             = "${env.BUILD_NUMBER}"                       // <-- the build number IS the tag
-        FULL_IMAGE_PATH = "${JFROG_URL}/${REPO_NAME}/${IMAGE_NAME}:${TAG}"
-        JFROG_CREDS     = 'jfrog-docker'                             // Jenkins username+token credential
+        TAG             = "${env.BUILD_NUMBER}"                      // build number IS the tag
+        FULL_IMAGE_PATH = "${ECR_REGISTRY}/${IMAGE_NAME}:${TAG}"
     }
 
     options {
@@ -49,9 +50,6 @@ pipeline {
 
     stages {
         stage('Checkout') {
-          // Single Jenkins instance (no agents): the build runs on the controller
-          // and checks the repo out into the JOB WORKSPACE. This guarantees we
-          // build the LATEST commit of the configured branch every time.
           steps {
             script {
               def relNum = params.ReleaseNumber?.trim()
@@ -62,10 +60,9 @@ pipeline {
               if (mainRepos.size() != 1) error("Exactly one repo must have isMain: true")
               def mainRepo = mainRepos[0]
 
-              // pull the job's configured repo/branch into the workspace:
               checkout scm
 
-              env.MAIN_DIR = "${env.WORKSPACE}"        // build from the workspace root
+              env.MAIN_DIR = "${env.WORKSPACE}"
               env.GIT_SHA  = sh(script: 'git rev-parse --short=7 HEAD', returnStdout: true).trim()
               env.GIT_BRANCH_NAME = sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim()
               echo "${mainRepo.name} checked out @ ${env.GIT_SHA} (${env.GIT_BRANCH_NAME})"
@@ -76,15 +73,14 @@ pipeline {
 
         stage('Build and Push') {
             steps {
-                withCredentials([usernamePassword(credentialsId: env.JFROG_CREDS,
-                    usernameVariable: 'JF_USER', passwordVariable: 'JF_PASS')]) {
-                    sh """#!/bin/bash
-                        set -euo pipefail
-                        echo "\$JF_PASS" | docker login ${JFROG_URL} -u "\$JF_USER" --password-stdin
-                        DOCKER_BUILDKIT=0 docker build -t ${FULL_IMAGE_PATH} -f Dockerfile .
-                        docker push ${FULL_IMAGE_PATH}
-                    """
-                }
+                sh """#!/bin/bash
+                    set -euo pipefail
+                    # authenticate to ECR using the EC2 instance role (no stored creds):
+                    aws ecr get-login-password --region ${AWS_REGION} \
+                      | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                    DOCKER_BUILDKIT=0 docker build -t ${FULL_IMAGE_PATH} -f Dockerfile .
+                    docker push ${FULL_IMAGE_PATH}
+                """
             }
         }
 
@@ -94,9 +90,11 @@ pipeline {
                 =====================================================================
                 PUBLISHED:  ${FULL_IMAGE_PATH}
                             (built from commit ${GIT_SHA}, branch ${ReleaseNumber})
-                Promote into an environment (manual, in the gitops repo):
-                  environments/idevN/values.yaml  ->  image.tag: "${TAG}"
-                  git commit && push  ->  ArgoCD deploys ONLY that environment.
+                Fetch the pullable digest (ECR serves by digest reliably):
+                  aws ecr describe-images --repository-name ${IMAGE_NAME} \\
+                    --region ${AWS_REGION} --image-ids imageTag=${TAG} \\
+                    --query 'imageDetails[0].imageDigest' --output text
+                Promote: environments/idevN/values.yaml -> that tag + digest, commit, push.
                 =====================================================================
                 """
             }
@@ -107,7 +105,7 @@ pipeline {
         always {
             sh """
                 docker rmi ${FULL_IMAGE_PATH} || true
-                docker logout ${JFROG_URL} || true
+                docker logout ${ECR_REGISTRY} || true
             """
         }
     }
