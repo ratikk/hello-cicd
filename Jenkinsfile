@@ -78,7 +78,7 @@ pipeline {
             steps {
                 withCredentials([usernamePassword(credentialsId: env.JFROG_CREDS,
                     usernameVariable: 'JF_USER', passwordVariable: 'JF_PASS')]) {
-                    sh """
+                    sh """#!/bin/bash
                         set -euo pipefail
                         echo "\$JF_PASS" | docker login ${JFROG_URL} -u "\$JF_USER" --password-stdin
                         DOCKER_BUILDKIT=0 docker build -t ${FULL_IMAGE_PATH} -f Dockerfile .
