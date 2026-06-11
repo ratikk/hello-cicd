@@ -1,120 +1,114 @@
+import java.util.Date
+
 // =============================================================================
-// hello-cicd — Jenkins CI (parameterized by RELEASE_NUMBER)
+// hello-cicd — Jenkins CI, built in the HHS RAE pattern.
 //
-//   You run the job with RELEASE_NUMBER = 120 (or 121, 122, ...).
-//   Jenkins builds the image and tags it EXACTLY that release number, then
-//   pushes to JFrog. No manual `docker tag` afterward — Jenkins owns the tag.
+//   The image TAG is the Jenkins BUILD_NUMBER (auto-incrementing) — every build
+//   is uniquely numbered by Jenkins itself. ReleaseNumber selects the git BRANCH
+//   to build (not the tag). Images are pushed to JFrog as:
+//       <JFROG_URL>/<REPO_NAME>/<IMAGE_NAME>:<BUILD_NUMBER>
 //
-//   To promote a release into an environment, edit that env's values file:
-//     charts/hello-cicd/values-idevN.yaml  →  image.tag: "<RELEASE_NUMBER>"
-//   commit + push the gitops repo → ArgoCD deploys it.
-//
-// Prereqs on the Jenkins VM:
-//   - Docker available to the jenkins user
-//   - Jenkins credential 'jfrog-docker' (username + token)
+//   To promote a build into an environment, edit that env's values file:
+//       environments/idevN/values.yaml  ->  image.tag: "<BUILD_NUMBER>"
+//   commit + push the gitops repo -> ArgoCD deploys ONLY that environment.
 // =============================================================================
+
+// One entry per source repo. Exactly one must have isMain:true. For this lab
+// there is a single app repo; Jenkins checks it out into the workspace via
+// `checkout scm` (the job's configured Git repo/branch), so no path is needed.
+def projectReposFor = { String releaseNumber ->
+  [
+    [name: 'hello-cicd', isMain: true],
+  ]
+}
+
 pipeline {
-  agent any
+    agent any
 
-  parameters {
-    string(
-      name: 'RELEASE_NUMBER',
-      defaultValue: '120',
-      description: 'The release number to build and tag (e.g. 120, 121, 122). This becomes the image tag.'
-    )
-  }
+    parameters {
+        string(name: 'ReleaseNumber',        defaultValue: 'main', description: 'Git branch to build (e.g. main, REL-1.2). Selects the branch, NOT the tag.')
+        string(name: 'ReleaseBranchPrefix',  defaultValue: '/REL', description: 'Branch prefix')
+        booleanParam(name: 'ForceBuild',     defaultValue: true,  description: 'Force Build')
+        booleanParam(name: 'SKIP_GIT_TAG',   defaultValue: false, description: 'Skip tagging + metadata')
+    }
 
-  environment {
-    JFROG_HOST     = 'triald3uyq5.jfrog.io'
-    JFROG_VIRTUAL  = "${JFROG_HOST}/sample-docker"     // base-image proxy
-    JFROG_APP_REPO = "${JFROG_HOST}/sample-docker"     // built images go here
-    IMAGE_NAME     = 'hello-cicd'
-    JFROG_CREDS    = 'jfrog-docker'
-  }
+    environment {
+        JFROG_URL       = 'triald3uyq5.jfrog.io'
+        REPO_NAME       = 'sample-docker'
+        IMAGE_NAME      = 'hello-cicd'
+        TAG             = "${env.BUILD_NUMBER}"                       // <-- the build number IS the tag
+        FULL_IMAGE_PATH = "${JFROG_URL}/${REPO_NAME}/${IMAGE_NAME}:${TAG}"
+        JFROG_CREDS     = 'jfrog-docker'                             // Jenkins username+token credential
+    }
 
-  options {
-    timestamps()
-    disableConcurrentBuilds()
-    buildDiscarder(logRotator(numToKeepStr: '20'))
-  }
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
 
-  stages {
-    stage('Validate input') {
-      steps {
-        script {
-          if (!params.RELEASE_NUMBER?.trim()) {
-            error "RELEASE_NUMBER is required (e.g. 120)."
+    stages {
+        stage('Checkout') {
+          // Single Jenkins instance (no agents): the build runs on the controller
+          // and checks the repo out into the JOB WORKSPACE. This guarantees we
+          // build the LATEST commit of the configured branch every time.
+          steps {
+            script {
+              def relNum = params.ReleaseNumber?.trim()
+              if (!relNum) error("ReleaseNumber is required")
+
+              def repos = projectReposFor(relNum)
+              def mainRepos = repos.findAll { it.isMain == true }
+              if (mainRepos.size() != 1) error("Exactly one repo must have isMain: true")
+              def mainRepo = mainRepos[0]
+
+              // pull the job's configured repo/branch into the workspace:
+              checkout scm
+
+              env.MAIN_DIR = "${env.WORKSPACE}"        // build from the workspace root
+              env.GIT_SHA  = sh(script: 'git rev-parse --short=7 HEAD', returnStdout: true).trim()
+              env.GIT_BRANCH_NAME = sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim()
+              echo "${mainRepo.name} checked out @ ${env.GIT_SHA} (${env.GIT_BRANCH_NAME})"
+              echo "Building ${env.FULL_IMAGE_PATH} from commit ${env.GIT_SHA}"
+            }
           }
-          // the release number IS the image tag — immutable, meaningful
-          env.IMAGE_TAG = params.RELEASE_NUMBER.trim()
-          echo "Building release ${env.IMAGE_TAG} → ${env.JFROG_APP_REPO}/${env.IMAGE_NAME}:${env.IMAGE_TAG}"
         }
-      }
-    }
 
-    stage('Checkout') {
-      steps {
-        checkout scm
-        script {
-          env.GIT_SHA = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-          echo "Source commit: ${env.GIT_SHA}"
+        stage('Build and Push') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: env.JFROG_CREDS,
+                    usernameVariable: 'JF_USER', passwordVariable: 'JF_PASS')]) {
+                    sh """
+                        set -euo pipefail
+                        echo "\$JF_PASS" | docker login ${JFROG_URL} -u "\$JF_USER" --password-stdin
+                        DOCKER_BUILDKIT=0 docker build -t ${FULL_IMAGE_PATH} -f Dockerfile .
+                        docker push ${FULL_IMAGE_PATH}
+                    """
+                }
+            }
         }
-      }
-    }
 
-    stage('Login to JFrog') {
-      steps {
-        withCredentials([usernamePassword(credentialsId: env.JFROG_CREDS,
-            usernameVariable: 'JF_USER', passwordVariable: 'JF_PASS')]) {
-          sh 'echo "$JF_PASS" | docker login "$JFROG_HOST" -u "$JF_USER" --password-stdin'
+        stage('Done') {
+            steps {
+                echo """
+                =====================================================================
+                PUBLISHED:  ${FULL_IMAGE_PATH}
+                            (built from commit ${GIT_SHA}, branch ${ReleaseNumber})
+                Promote into an environment (manual, in the gitops repo):
+                  environments/idevN/values.yaml  ->  image.tag: "${TAG}"
+                  git commit && push  ->  ArgoCD deploys ONLY that environment.
+                =====================================================================
+                """
+            }
         }
-      }
     }
 
-    stage('Build (base from JFrog)') {
-      steps {
-        // The page now renders ENVIRONMENT + RELEASE from env vars at startup,
-        // so the image itself is environment-agnostic — the SAME image serves
-        // every idev env; the Helm values inject the per-env identity.
-        sh '''
-          docker build \
-            --provenance=false \
-            --platform linux/amd64 \
-            --build-arg REGISTRY="${JFROG_VIRTUAL}/" \
-            -t "${JFROG_APP_REPO}/${IMAGE_NAME}:${IMAGE_TAG}" \
-            .
-        '''
-      }
+    post {
+        always {
+            sh """
+                docker rmi ${FULL_IMAGE_PATH} || true
+                docker logout ${JFROG_URL} || true
+            """
+        }
     }
-
-    stage('Push to JFrog') {
-      steps {
-        sh 'docker push "${JFROG_APP_REPO}/${IMAGE_NAME}:${IMAGE_TAG}"'
-      }
-    }
-
-    stage('Done') {
-      steps {
-        echo """
-        =====================================================================
-        PUBLISHED:  ${JFROG_APP_REPO}/${IMAGE_NAME}:${IMAGE_TAG}
-                    (built from commit ${GIT_SHA})
-
-        Promote into an environment (manual, in the gitops repo):
-          charts/hello-cicd/values-idevN.yaml →  image.tag: "${IMAGE_TAG}"
-          git commit && push  →  ArgoCD deploys ONLY that environment.
-        =====================================================================
-        """
-      }
-    }
-  }
-
-  post {
-    always {
-      sh '''
-        docker rmi "${JFROG_APP_REPO}/${IMAGE_NAME}:${IMAGE_TAG}" || true
-        docker logout "${JFROG_HOST}" || true
-      '''
-    }
-  }
 }
